@@ -1,8 +1,7 @@
-"""Core vectorization engine - contours to bezier paths."""
+"""Core vectorization engine - contours to clean SVG paths."""
 
 import numpy as np
 import cv2
-from scipy.interpolate import splprep, splev
 from dataclasses import dataclass
 
 
@@ -36,36 +35,30 @@ def simplify_contour(contour: np.ndarray, epsilon_factor: float = 0.001) -> np.n
 
 
 def contour_to_points(contour: np.ndarray) -> list[tuple[float, float]]:
-    """Convert OpenCV contour to list of (x, y) points."""
-    points = []
-    for pt in contour:
-        x, y = pt[0]
-        points.append((float(x), float(y)))
-    return points
+    """Convert OpenCV contour to list of (x, float, y) points."""
+    return [(float(pt[0][0]), float(pt[0][1])) for pt in contour]
 
 
-def fit_bezier_curve(
+def smooth_points(
     points: list[tuple[float, float]],
-    smooth: int = 5,
+    factor: float = 0.2,
 ) -> list[tuple[float, float]]:
-    """Fit a bezier/spline curve to points and return sampled result."""
-    if len(points) < 3:
+    """Simple moving-average smoothing for polyline points.
+    Keeps first and last points unchanged.
+    """
+    if len(points) < 4:
         return points
 
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-
-    try:
-        # splprep needs at least degree+1 points
-        k = min(3, len(points) - 1)
-        tck, u = splprep([xs, ys], s=0.5, k=k)
-        # Generate more points along the curve
-        num_samples = max(len(points), smooth * 10)
-        u_new = np.linspace(0, 1, num_samples)
-        x_new, y_new = splev(u_new, tck)
-        return list(zip(x_new.tolist(), y_new.tolist()))
-    except (ValueError, TypeError):
-        return points
+    smoothed = [points[0]]
+    for i in range(1, len(points) - 1):
+        prev = points[i - 1]
+        curr = points[i]
+        next_ = points[i + 1]
+        sx = curr[0] * (1 - factor) + (prev[0] + next_[0]) * factor * 0.5
+        sy = curr[1] * (1 - factor) + (prev[1] + next_[1]) * factor * 0.5
+        smoothed.append((sx, sy))
+    smoothed.append(points[-1])
+    return smoothed
 
 
 def points_to_svg_path(
@@ -73,36 +66,38 @@ def points_to_svg_path(
     smooth: int = 5,
     closed: bool = True,
 ) -> str:
-    """Convert points to SVG path data string."""
+    """Convert points to SVG path data as clean polylines with optional Catmull-Rom smoothing."""
     if len(points) < 2:
         return ""
 
+    # Apply lightweight polyline smoothing
     if smooth > 0:
-        points = fit_bezier_curve(points, smooth)
+        factor = min(0.35, smooth * 0.05)
+        points = smooth_points(points, factor)
 
     d_parts = []
     x0, y0 = points[0]
-    d_parts.append(f"M{x0:.2f},{y0:.2f}")
+    d_parts.append(f"M{x0:.1f},{y0:.1f}")
 
     if len(points) == 2:
         x1, y1 = points[1]
-        d_parts.append(f"L{x1:.2f},{y1:.2f}")
-    elif len(points) >= 3:
-        for i in range(1, len(points) - 1, 2):
-            cx, cy = points[i]
-            if i + 1 < len(points):
-                ex, ey = points[i + 1]
-                d_parts.append(f"C{cx:.2f},{cy:.2f} {cx:.2f},{cy:.2f} {ex:.2f},{ey:.2f}")
-            else:
-                cx2, cy2 = points[i]
-                d_parts.append(f"Q{cx2:.2f},{cy2:.2f} {x0:.2f},{y0:.2f}")
-        # Fallback: add remaining points as lines
-        remaining = len(points) - 1
-        if remaining % 2 == 0:
-            pass  # already handled
-        else:
-            lx, ly = points[-1]
-            d_parts.append(f"L{lx:.2f},{ly:.2f}")
+        d_parts.append(f"L{x1:.1f},{y1:.1f}")
+    else:
+        # Use quadratic bezier (Q) via Catmull-Rom to cubic conversion for smooth curves
+        for i in range(1, len(points) - 1):
+            p0 = points[i - 1]
+            p1 = points[i]
+            p2 = points[i + 1]
+
+            # Catmull-Rom control point → quadratic bezier approximation
+            cpx = p1[0] + (p2[0] - p0[0]) / 6.0
+            cpy = p1[1] + (p2[1] - p0[1]) / 6.0
+
+            d_parts.append(f"Q{cpx:.1f},{cpy:.1f} {(p1[0]+p2[0])/2:.1f},{(p1[1]+p2[1])/2:.1f}")
+
+        # Final point
+        lx, ly = points[-1]
+        d_parts.append(f"L{lx:.1f},{ly:.1f}")
 
     if closed:
         d_parts.append("Z")
@@ -153,7 +148,7 @@ def trace_all_layers(
 
     Args:
         layers: List of (color, mask) tuples
-        smooth: Bezier smoothing level
+        smooth: Smoothing level (0=none, 10=max)
         min_area: Minimum contour area to keep
         epsilon_factor: Douglas-Peucker simplification factor
 
